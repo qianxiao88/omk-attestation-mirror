@@ -2,10 +2,11 @@ name: Sync attestation status
 
 on:
   schedule:
-    # Every 30 minutes. Upstream sends `cache-control: max-age=86400` and its
-    # Last-Modified moves about once a day, so the conditional request below
-    # turns most runs into a 304 with no body transfer and no commit.
-    - cron: '*/30 * * * *'
+    # Every three hours. Upstream sends `cache-control: max-age=86400` and its
+    # Last-Modified moves about once a day, so this cadence already catches every
+    # revision, and the conditional request below still makes an unchanged run a
+    # single 304 with no body transfer and no commit.
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 permissions:
