@@ -2,14 +2,18 @@ name: Sync attestation status
 
 on:
   schedule:
-    # Every 10 minutes. Upstream advertises cache-control: max-age=86400 and its
-    # Last-Modified moves about once a day, so most runs are conditional hits
-    # that finish in a couple of seconds and produce no commit.
-    - cron: '*/10 * * * *'
+    # Every 30 minutes. Upstream sends `cache-control: max-age=86400` and its
+    # Last-Modified moves about once a day, so the conditional request below
+    # turns most runs into a 304 with no body transfer and no commit.
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -21,24 +25,28 @@ jobs:
         run: |
           set -euo pipefail
           url=https://android.googleapis.com/attestation/status
-          # Reuse the stored validator so an unchanged list costs a 304 and no
-          # body transfer. ETag is preferred; Last-Modified is the fallback.
-          : > .headers
-          if [ -f etag.txt ]; then
-            curl -fsS --retry 3 --retry-delay 5 --max-time 60 -D .headers \
-              -H "@etag.txt" "$url" -o status.json || true
-          elif [ -f last-modified.txt ]; then
-            curl -fsS --retry 3 --retry-delay 5 --max-time 60 -D .headers \
-              -H "@last-modified.txt" "$url" -o status.json || true
-          else
-            curl -fsS --retry 3 --retry-delay 5 --max-time 60 -D .headers \
-              "$url" -o status.json
+          rm -f status.json .headers
+
+          # The endpoint has no ETag, so Last-Modified is the only validator.
+          # Sending it back makes an unchanged list cost one round trip.
+          validator=()
+          if [ -f last-modified.txt ]; then
+            validator=(-H "@last-modified.txt")
           fi
-          if grep -qiE '^HTTP/[0-9.]+ 304' .headers; then
+
+          code=$(curl -sS -o status.json -D .headers -w '%{http_code}' \
+            --retry 3 --retry-delay 5 --max-time 60 "${validator[@]}" "$url")
+
+          if [ "$code" = "304" ]; then
             echo "not modified"
             rm -f status.json
             exit 0
           fi
+          if [ "$code" != "200" ]; then
+            echo "upstream returned HTTP $code"
+            exit 1
+          fi
+
           python3 - <<'PY'
           import json, sys
           with open('status.json', encoding='utf-8') as handle:
@@ -48,12 +56,15 @@ jobs:
               sys.exit('upstream did not return a status list')
           print(f"entries: {len(entries)}")
           PY
-          # Keep the next run conditional on this exact revision.
-          tr -d '\r' < .headers | grep -i '^etag:' | tail -1 | sed 's/^[Ee][Tt][Aa][Gg]: *//' \
-            | sed 's/^/If-None-Match: /' > etag.txt || rm -f etag.txt
-          tr -d '\r' < .headers | grep -i '^last-modified:' | tail -1 \
-            | sed 's/^[Ll][Aa][Ss][Tt]-[Mm][Oo][Dd][Ii][Ff][Ii][Ee][Dd]: *//' \
-            | sed 's/^/If-Modified-Since: /' > last-modified.txt || rm -f last-modified.txt
+
+          # Remember this revision so the next run can ask for a 304.
+          stamp=$(tr -d '\r' < .headers | grep -i '^last-modified:' | tail -1 \
+            | sed 's/^[^:]*: *//')
+          if [ -n "$stamp" ]; then
+            printf 'If-Modified-Since: %s\n' "$stamp" > last-modified.txt
+          else
+            rm -f last-modified.txt
+          fi
           rm -f .headers
 
       - name: Commit when the list changed
@@ -63,12 +74,12 @@ jobs:
             echo "unchanged"
             exit 0
           fi
-          # `git diff --quiet -- path` reports "no change" for an untracked file,
-          # so the first run would skip the commit and the mirror would stay
-          # empty. Stage first, then ask about the index.
           git config user.name "sync"
           git config user.email "sync@users.noreply.github.com"
-          git add status.json etag.txt last-modified.txt
+          # `git diff --quiet -- path` reports "no change" for an untracked file,
+          # and `git add <missing path>` aborts, so stage everything present and
+          # then ask about the index instead of naming paths.
+          git add -A .
           if git diff --cached --quiet; then
             echo "unchanged"
             exit 0
