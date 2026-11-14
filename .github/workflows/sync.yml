@@ -1,0 +1,44 @@
+name: Sync attestation status
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub may delay scheduled runs under load.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the status list
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 --max-time 60 \
+            https://android.googleapis.com/attestation/status -o status.json
+          python3 - <<'PY'
+          import json, sys
+          with open('status.json', encoding='utf-8') as handle:
+              data = json.load(handle)
+          entries = data.get('entries')
+          if not isinstance(entries, dict) or not entries:
+              sys.exit('upstream did not return a status list')
+          print(f"entries: {len(entries)}")
+          PY
+
+      - name: Commit when the list changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- status.json; then
+            echo "unchanged"
+            exit 0
+          fi
+          git config user.name "sync"
+          git config user.email "sync@users.noreply.github.com"
+          git add status.json
+          git commit -m "Sync attestation status $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
